@@ -1,0 +1,26 @@
+# Model checkpoints
+checkpoints/*.pt
+
+# Tokenized / processed datasets
+data/*.model
+data/tokenized
+
+# Training logs
+logs/
+
+# play - jupiter notebook
+play.ipynb
+
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+
+# Heavy model weight formats
+*.safetensors
+*.bin
+*.pth
+*.ckpt
