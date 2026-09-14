@@ -2,6 +2,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from evaluation.metrics import EvaluationMetrics
 from generation.generator import Generator
+from pathlib import Path
 
 
 class Trainer:
@@ -27,6 +28,9 @@ class Trainer:
         self.evaluator = evaluator
         self.checkpoint_manager = checkpoint_manager
 
+        self.generation_directory = Path("generation")
+        self.generation_directory.mkdir(parents=True, exist_ok=True)
+        
         # The model must already be on the correct device.
         if distributed.is_distributed:
             self.model = DDP(
@@ -44,10 +48,10 @@ class Trainer:
             model=self.raw_model
         )
 
-    def train(self):
+    def train(self, start_step = 0):
         self.model.train()
         eval_metrics = EvaluationMetrics()
-        for step in range(self.config.train.max_steps):
+        for step in range(start_step, self.config.train.max_steps):
 
             # ------------------------------------------------------
             # Select language for THIS optimizer step
@@ -173,29 +177,7 @@ class Trainer:
                     eval_metrics.report(
                         step=step + 1,
                     )
-                    
-                    with torch.inference_mode():
-                        urdu_generations = self.generator.generate_many(
-                            prompt="ایک زمانے کی بات ہے",
-                            num_generations=5,
-                            max_new_tokens=100,
-                            temperature=0.8,
-                            top_k=50,
-                        )
-                        hindi_generations = self.generator.generate_many(
-                            prompt="एक ज़माने की बात है।",
-                            num_generations=5,
-                            max_new_tokens=100,
-                            temperature=0.8,
-                            top_k=50,
-                        )
-
-                    for i, (urdu, hindi) in enumerate(
-                        zip(urdu_generations, hindi_generations), 1
-                    ):
-                        print(f"\n--- Generation {i} ---")
-                        print(f"Urdu:  {urdu}")
-                        print(f"Hindi: {hindi}")
+                    self.generate_samples(step=step + 1)
                         
                 # Wait for master to finish generation before
                 # any rank starts the next training step.
@@ -237,3 +219,89 @@ class Trainer:
         # Make sure all ranks wait for final model to finish saving
         if self.distributed.is_distributed:
             torch.distributed.barrier()
+            
+           
+    def generate_samples(self, step):
+        urdu_prompt = "ایک زمانے کی بات ہے"
+        hindi_prompt = "एक ज़माने की बात है۔"
+
+        temperature = 0.8
+        top_k = 50
+        max_new_tokens = 255
+        num_generations = 5
+
+        with torch.inference_mode():
+            urdu_generations = self.generator.generate_many(
+                prompt=urdu_prompt,
+                num_generations=num_generations,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+            )
+
+            hindi_generations = self.generator.generate_many(
+                prompt=hindi_prompt,
+                num_generations=num_generations,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+            )
+
+        for i, (urdu, hindi) in enumerate(
+            zip(urdu_generations, hindi_generations), 1
+        ):
+            print(f"\n--- Generation {i} ---")
+            print(f"Urdu:  {urdu}")
+            print(f"Hindi: {hindi}")
+
+        self.save_generations(
+            step=step,
+            urdu_prompt=urdu_prompt,
+            urdu_generations=urdu_generations,
+            hindi_prompt=hindi_prompt,
+            hindi_generations=hindi_generations,
+            temperature=temperature,
+            top_k=top_k,
+            max_new_tokens=max_new_tokens,
+        )
+    
+     
+    def save_generations(
+        self,
+        *,
+        step,
+        urdu_prompt,
+        urdu_generations,
+        hindi_prompt,
+        hindi_generations,
+        temperature,
+        top_k,
+        max_new_tokens,
+    ):
+        path = self.generation_directory / "generations.txt"
+
+        with path.open("a", encoding="utf-8") as f:
+            f.write("=" * 80 + "\n")
+            f.write(f"STEP {step}\n")
+            f.write("=" * 80 + "\n\n")
+
+            f.write("Generation settings:\n")
+            f.write(f"Temperature: {temperature}\n")
+            f.write(f"Top-k: {top_k}\n")
+            f.write(f"Max new tokens: {max_new_tokens}\n\n")
+
+            f.write(f"URDU PROMPT:\n{urdu_prompt}\n\n")
+
+            for i, generation in enumerate(urdu_generations, 1):
+                f.write(f"--- Urdu Generation {i} ---\n")
+                f.write(generation)
+                f.write("\n\n")
+
+            f.write(f"HINDI PROMPT:\n{hindi_prompt}\n\n")
+
+            for i, generation in enumerate(hindi_generations, 1):
+                f.write(f"--- Hindi Generation {i} ---\n")
+                f.write(generation)
+                f.write("\n\n")
+
+            f.write("\n")

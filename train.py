@@ -67,7 +67,8 @@ def main():
         max_steps=config.train.max_steps,
     )
 
-    metrics.summary()
+    if distributed.master_process:
+        metrics.summary()
     # --------------------------------------------------------------
     # Optimizer
     # --------------------------------------------------------------
@@ -109,6 +110,33 @@ def main():
     
     # checkpoint manager
     checkpoint_manager = CheckpointManager()
+    
+    # # ----------------------------------------------------------
+    # # Resume
+    # # ----------------------------------------------------------
+
+    # start_step = 0
+
+    # checkpoint_path = "checkpoints/checkpoint_step_004000.pt"
+
+    # if checkpoint_path:
+    #     checkpoint = checkpoint_manager.load(
+    #         path=checkpoint_path,
+    #         model=model,
+    #         optimizer=optimizer,
+    #         scheduler=scheduler,
+    #         train_loader=train_loader,
+    #         metrics=metrics,
+    #         device=distributed.device,
+    #     )
+
+    #     start_step = checkpoint["step"]
+
+    # if distributed.master_process:
+    #     print(
+    #         f"Resuming training from step {start_step}"
+    #     )
+
     # --------------------------------------------------------------
     # Trainer
     # --------------------------------------------------------------
