@@ -3,9 +3,9 @@ import sentencepiece as spm
 from config import Config
 
 class Generator:
-    def __init__(self, model):
-        self.model = model
-        self.tokenizer = sp = spm.SentencePieceProcessor(model_file=str(Config().tokenizer.model_path))
+    def __init__(self, model, tokenizer = None):
+        self.model = getattr(model, "module", model)
+        self.tokenizer = tokenizer if tokenizer else spm.SentencePieceProcessor(model_file=str(Config().tokenizer.model_path))
 
     @torch.no_grad()
     def generate(

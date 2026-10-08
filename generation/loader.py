@@ -1,6 +1,6 @@
 import torch
 
-from model.gpt import GPT
+from model.model import Model
 
 
 class ModelLoader:
@@ -35,9 +35,18 @@ class ModelLoader:
         )
 
     def _build_model(self, state_dict):
-        model = GPT(self.config)
+        model = Model(self.config)
 
-        model.load_state_dict(state_dict)
+        # FIX: Strip the 'module.' prefix added during multi-GPU DDP training
+        cleaned_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith('module.'):
+                cleaned_state_dict[k[7:]] = v  # k[7:] cuts off the first 7 characters ('module.')
+            else:
+                cleaned_state_dict[k] = v
+
+        # Load the cleaned weights into your initialized model structure
+        model.load_state_dict(cleaned_state_dict)
         model.to(self.device)
         model.eval()
 

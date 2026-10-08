@@ -4,6 +4,8 @@ import numpy as np
 
 
 class TokenDataset:
+    """Memory-mapped token dataset that can switch between languages."""
+
     def __init__(
         self,
         data_dir,
@@ -15,69 +17,35 @@ class TokenDataset:
         self.languages = tuple(languages)
 
         if not self.languages:
-            raise ValueError(
-                "At least one language must be provided."
-            )
+            raise ValueError("At least one language must be provided.")
 
-        # ----------------------------------------------------------
-        # Load all language states
-        # ----------------------------------------------------------
-
+        # Load metadata and memory-mapped shards for every language up front.
+        # This keeps switching cheap later on.
         self.states = {}
 
         for language in self.languages:
-            self.states[language] = self._load_language(
-                language
-            )
+            self.states[language] = self._load_language(language)
 
-        # ----------------------------------------------------------
-        # Currently active language
-        # ----------------------------------------------------------
-
+        # Which language we're currently reading from.
         self.lang = self.languages[0]
 
-    # ==============================================================
-    # Language loading
-    # ==============================================================
-
     def _load_language(self, language):
-        split_dir = (
-            self.data_dir
-            / self.split
-            / language
-        )
+        split_dir = self.data_dir / self.split / language
 
         if not split_dir.exists():
-            raise FileNotFoundError(
-                f"Dataset split not found: "
-                f"{split_dir}"
-            )
+            raise FileNotFoundError(f"Dataset split not found: {split_dir}")
 
-        # ----------------------------------------------------------
-        # Find shards
-        # ----------------------------------------------------------
-
-        shard_paths = sorted(
-            split_dir.glob("shard_*.npy")
-        )
+        # Shards are named shard_*.npy and sorted so their order is stable.
+        shard_paths = sorted(split_dir.glob("shard_*.npy"))
 
         if not shard_paths:
-            raise FileNotFoundError(
-                f"No token shards found in: "
-                f"{split_dir}"
-            )
+            raise FileNotFoundError(f"No token shards found in: {split_dir}")
 
-        # ----------------------------------------------------------
-        # Memory-map shards
-        # ----------------------------------------------------------
-
+        # Memory-map each shard so we don't load everything into RAM.
         shards = []
 
         for path in shard_paths:
-            tokens = np.load(
-                path,
-                mmap_mode="r",
-            )
+            tokens = np.load(path, mmap_mode="r")
 
             if tokens.ndim != 1:
                 raise ValueError(
@@ -87,15 +55,8 @@ class TokenDataset:
 
             shards.append(tokens)
 
-        # ----------------------------------------------------------
-        # Calculate shard boundaries
-        # ----------------------------------------------------------
-
-        shard_sizes = [
-            len(shard)
-            for shard in shards
-        ]
-
+        # Precompute where each shard starts in the concatenated stream.
+        shard_sizes = [len(shard) for shard in shards]
         shard_offsets = []
 
         offset = 0
@@ -104,42 +65,26 @@ class TokenDataset:
             shard_offsets.append(offset)
             offset += size
 
-        # ----------------------------------------------------------
-        # Return immutable dataset metadata/state
-        # ----------------------------------------------------------
-
         return {
             "language": language,
             "split": self.split,
             "split_dir": split_dir,
-
             "shard_paths": shard_paths,
             "shards": shards,
-
             "shard_sizes": shard_sizes,
             "shard_offsets": shard_offsets,
-
             "num_tokens": offset,
             "num_shards": len(shards),
         }
-
-    # ==============================================================
-    # Language selection
-    # ==============================================================
 
     def set_language(self, language):
         if language not in self.states:
             raise ValueError(
                 f"Unknown language: {language}. "
-                f"Available languages: "
-                f"{', '.join(self.languages)}"
+                f"Available languages: {', '.join(self.languages)}"
             )
 
         self.lang = language
-
-    # ==============================================================
-    # Current language state
-    # ==============================================================
 
     @property
     def state(self):
@@ -169,17 +114,11 @@ class TokenDataset:
     def shard_offsets(self):
         return self.state["shard_offsets"]
 
-    # ==============================================================
-    # Dataset access
-    # ==============================================================
-
     def get_slice(self, start, end):
         state = self.state
 
         if start < 0:
-            raise ValueError(
-                f"start must be >= 0, got {start}"
-            )
+            raise ValueError(f"start must be >= 0, got {start}")
 
         if end > state["num_tokens"]:
             raise ValueError(
@@ -189,95 +128,47 @@ class TokenDataset:
             )
 
         if start >= end:
-            raise ValueError(
-                f"Invalid slice: "
-                f"start={start}, end={end}"
-            )
+            raise ValueError(f"Invalid slice: start={start}, end={end}")
 
-        # ----------------------------------------------------------
-        # Find shard containing start
-        # ----------------------------------------------------------
-
+        # Find which shard contains `start`.
         start_shard = self._find_shard(start)
 
-        shard_start = state["shard_offsets"][
-            start_shard
-        ]
-
+        shard_start = state["shard_offsets"][start_shard]
         start_offset = start - shard_start
         end_offset = end - shard_start
 
         shard = state["shards"][start_shard]
 
-        # ----------------------------------------------------------
-        # Fast path:
-        # Entire slice is inside one shard.
-        # ----------------------------------------------------------
-
+        # Common case: the whole slice lives inside one shard.
         if end_offset <= len(shard):
-            return shard[
-                start_offset:end_offset
-            ]
+            return shard[start_offset:end_offset]
 
-        # ----------------------------------------------------------
-        # Cross-shard slice
-        # ----------------------------------------------------------
-
+        # Otherwise walk across shards and stitch the pieces together.
         chunks = []
-
         position = start
 
         while position < end:
             shard_index = self._find_shard(position)
+            shard_start = state["shard_offsets"][shard_index]
+            shard = state["shards"][shard_index]
 
-            shard_start = state["shard_offsets"][
-                shard_index
-            ]
+            local_start = position - shard_start
+            remaining_in_shard = len(shard) - local_start
+            remaining_to_read = end - position
 
-            shard = state["shards"][
-                shard_index
-            ]
+            count = min(remaining_in_shard, remaining_to_read)
 
-            local_start = (
-                position - shard_start
-            )
-
-            remaining_in_shard = (
-                len(shard) - local_start
-            )
-
-            remaining_to_read = (
-                end - position
-            )
-
-            count = min(
-                remaining_in_shard,
-                remaining_to_read,
-            )
-
-            chunks.append(
-                shard[
-                    local_start:
-                    local_start + count
-                ]
-            )
-
+            chunks.append(shard[local_start : local_start + count])
             position += count
 
         return np.concatenate(chunks)
 
-    # ==============================================================
-    # Helpers
-    # ==============================================================
-
     def _find_shard(self, position):
         state = self.state
 
-        for i in range(
-            len(state["shard_offsets"]) - 1,
-            -1,
-            -1,
-        ):
+        # Offsets are sorted, so scan backwards to find the last shard
+        # whose start is <= position.
+        for i in range(len(state["shard_offsets"]) - 1, -1, -1):
             if position >= state["shard_offsets"][i]:
                 return i
 
@@ -286,18 +177,12 @@ class TokenDataset:
             f"{position} in {self.lang}"
         )
 
-    # ==============================================================
-    # Dataset information
-    # ==============================================================
-
     def get_language_info(self, language=None):
         if language is None:
             language = self.lang
 
         if language not in self.states:
-            raise ValueError(
-                f"Unknown language: {language}"
-            )
+            raise ValueError(f"Unknown language: {language}")
 
         state = self.states[language]
 

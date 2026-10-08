@@ -4,6 +4,8 @@ from data.dataset import TokenDataset
 
 
 class DataLoaderLite:
+    """Streaming dataloader that can switch between languages."""
+
     def __init__(
         self,
         B,
@@ -24,109 +26,54 @@ class DataLoaderLite:
         self.data_dir = data_dir
         self.languages = tuple(languages)
 
-        # ----------------------------------------------------------
-        # Dataset
-        # ----------------------------------------------------------
-
+        # Load the dataset; we'll point it at different languages below.
         self.dataset = TokenDataset(
             data_dir=self.data_dir,
             split=self.split,
             languages=self.languages,
         )
 
-        # ----------------------------------------------------------
-        # Batch statistics
-        # ----------------------------------------------------------
-
-        self.tokens_per_batch = (
-            self.B * self.T
-        )
-
+        # Local batch size and global batch size, measured in tokens.
+        self.tokens_per_batch = self.B * self.T
         self.tokens_per_global_batch = (
-            self.tokens_per_batch
-            * self.num_processes
+            self.tokens_per_batch * self.num_processes
         )
 
-        # ----------------------------------------------------------
-        # Per-language statistics
-        # ----------------------------------------------------------
-
+        # Cache per-language token counts and epoch lengths.
         self.num_tokens = {}
-
         self.batches_per_epoch = {}
 
         for language in self.languages:
             self.dataset.set_language(language)
 
-            self.num_tokens[language] = (
-                self.dataset.num_tokens
-            )
-
+            self.num_tokens[language] = self.dataset.num_tokens
             self.batches_per_epoch[language] = (
-                self.num_tokens[language]
-                // self.tokens_per_global_batch
+                self.num_tokens[language] // self.tokens_per_global_batch
             )
 
-        # ----------------------------------------------------------
-        # Per-language, per-process position
-        # ----------------------------------------------------------
-        #
-        # Every process gets a different starting position.
-        #
-        # rank 0:
-        #   0
-        #
-        # rank 1:
-        #   B*T
-        #
-        # rank 2:
-        #   2*B*T
-        #
-        # etc.
-        #
-        # This state is maintained independently for every
-        # language.
-        # ----------------------------------------------------------
-
+        # Each process reads a different slice of the same stream. We keep
+        # a separate position per language so switching languages doesn't
+        # lose our place.
         self.positions = {}
 
         for language in self.languages:
             self.positions[language] = (
-                self.tokens_per_batch
-                * self.process_rank
+                self.tokens_per_batch * self.process_rank
             )
 
-        # ----------------------------------------------------------
-        # Active language
-        # ----------------------------------------------------------
-
+        # Start with the first language.
         self.lang = self.languages[0]
-
-        self.dataset.set_language(
-            self.lang
-        )
-
-    # --------------------------------------------------------------
-    # Language
-    # --------------------------------------------------------------
+        self.dataset.set_language(self.lang)
 
     def set_language(self, language):
         if language not in self.languages:
             raise ValueError(
                 f"Unknown language: {language}. "
-                f"Available languages: "
-                f"{', '.join(self.languages)}"
+                f"Available languages: {', '.join(self.languages)}"
             )
 
         self.lang = language
-
-        self.dataset.set_language(
-            language
-        )
-
-    # --------------------------------------------------------------
-    # Current position
-    # --------------------------------------------------------------
+        self.dataset.set_language(language)
 
     @property
     def current_position(self):
@@ -136,10 +83,6 @@ class DataLoaderLite:
     def current_position(self, value):
         self.positions[self.lang] = value
 
-    # --------------------------------------------------------------
-    # Current dataset statistics
-    # --------------------------------------------------------------
-
     @property
     def current_num_tokens(self):
         return self.num_tokens[self.lang]
@@ -148,89 +91,34 @@ class DataLoaderLite:
     def current_batches_per_epoch(self):
         return self.batches_per_epoch[self.lang]
 
-    # --------------------------------------------------------------
-    # Next batch
-    # --------------------------------------------------------------
-
     def next_batch(self):
         position = self.current_position
         num_tokens = self.current_num_tokens
 
-        # We need B*T + 1 tokens because:
-        #
-        # x = tokens[0 : B*T]
-        # y = tokens[1 : B*T+1]
-        #
-        # So y is shifted by one token.
+        # We need one extra token because y is x shifted by one.
+        end_position = position + self.tokens_per_batch + 1
 
-        end_position = (
-            position
-            + self.tokens_per_batch
-            + 1
-        )
-
-        # ----------------------------------------------------------
-        # Make sure this process has enough tokens.
-        # ----------------------------------------------------------
-
+        # If this process would read past the end, wrap around first.
         if end_position > num_tokens:
             self.reset()
 
             position = self.current_position
+            end_position = position + self.tokens_per_batch + 1
 
-            end_position = (
-                position
-                + self.tokens_per_batch
-                + 1
-            )
+        buf = self.dataset.get_slice(position, end_position)
+        buf = torch.from_numpy(buf.astype("int64"))
 
-        # ----------------------------------------------------------
-        # Read current language's data.
-        # ----------------------------------------------------------
+        x = buf[:-1].view(self.B, self.T)
+        y = buf[1:].view(self.B, self.T)
 
-        buf = self.dataset.get_slice(
-            position,
-            end_position,
-        )
-
-        # ----------------------------------------------------------
-        # Convert only this batch to PyTorch.
-        # ----------------------------------------------------------
-
-        buf = torch.from_numpy(
-            buf.astype("int64")
-        )
-
-        x = buf[:-1].view(
-            self.B,
-            self.T,
-        )
-
-        y = buf[1:].view(
-            self.B,
-            self.T,
-        )
-
-        # ----------------------------------------------------------
-        # Advance this language's position.
-        #
-        # IMPORTANT:
-        #
-        # We advance by the GLOBAL batch size, not B*T.
-        #
-        # Therefore all distributed processes move together
-        # through the language stream without overlapping.
-        # ----------------------------------------------------------
-
+        # Advance by the global batch size, not just the local one, so all
+        # ranks move through the language stream without overlapping.
         self.current_position = (
-            position
-            + self.tokens_per_global_batch
+            position + self.tokens_per_global_batch
         )
 
-        # ----------------------------------------------------------
-        # Start a new epoch for this language.
-        # ----------------------------------------------------------
-
+        # If the next batch would start past the end, reset now so the next
+        # call starts from the beginning of this language.
         if (
             self.current_position
             + self.tokens_per_batch
@@ -241,30 +129,16 @@ class DataLoaderLite:
 
         return x, y
 
-    # --------------------------------------------------------------
-    # Reset current language
-    # --------------------------------------------------------------
-
     def reset(self):
         self.current_position = (
-            self.tokens_per_batch
-            * self.process_rank
+            self.tokens_per_batch * self.process_rank
         )
-
-    # --------------------------------------------------------------
-    # Reset all languages
-    # --------------------------------------------------------------
 
     def reset_all(self):
         for language in self.languages:
             self.positions[language] = (
-                self.tokens_per_batch
-                * self.process_rank
+                self.tokens_per_batch * self.process_rank
             )
-
-    # --------------------------------------------------------------
-    # State inspection
-    # --------------------------------------------------------------
 
     def get_positions(self):
         return dict(self.positions)

@@ -6,6 +6,8 @@ from pathlib import Path
 
 
 class Trainer:
+    """Main training loop with DDP support, evaluation, and checkpointing."""
+
     def __init__(
         self,
         model,
@@ -28,56 +30,49 @@ class Trainer:
         self.evaluator = evaluator
         self.checkpoint_manager = checkpoint_manager
 
+        # Where we dump sample generations during training.
         self.generation_directory = Path("generation")
         self.generation_directory.mkdir(parents=True, exist_ok=True)
-        
-        # The model must already be on the correct device.
+
+        # The model must already be on the correct device before wrapping.
         if distributed.is_distributed:
             self.model = DDP(
                 self.model,
                 device_ids=[distributed.local_rank],
             )
 
+        # Keep a handle to the unwrapped model for generation and saving.
         self.raw_model = (
             self.model.module
             if distributed.is_distributed
             else self.model
         )
-        
-        self.generator = generator = Generator(
-            model=self.raw_model
-        )
 
-    def train(self, start_step = 0):
+        self.generator = Generator(model=self.raw_model)
+
+    def train(self, start_step=0):
         self.model.train()
         eval_metrics = EvaluationMetrics()
-        for step in range(start_step, self.config.train.max_steps):
 
-            # ------------------------------------------------------
-            # Select language for THIS optimizer step
-            # ------------------------------------------------------
+        for step in range(start_step, self.config.train.max_steps):
+            path = self.checkpoint_manager.save_final_model(
+                model=self.model,
+                filename="final_model.pt",
+            )
+            # import sys; sys.exit(0)
+            # Alternate languages every optimizer step so both see updates.
             language = 'urdu' if step % 2 == 0 else 'hindi'
             # language = 'urdu'
 
             self.train_loader.set_language(language)
-            # ------------------------------------------------------
-            # Start metrics timing
-            # ------------------------------------------------------
 
             self.metrics.start_step()
 
-            # ------------------------------------------------------
-            # Learning rate
-            # ------------------------------------------------------
-
+            # Linear (or whatever) LR schedule — set it before the step.
             lr = self.scheduler.get_lr(step)
 
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = lr
-
-            # ------------------------------------------------------
-            # Gradient accumulation
-            # ------------------------------------------------------
 
             self.optimizer.zero_grad(set_to_none=True)
 
@@ -91,8 +86,8 @@ class Trainer:
                 x = x.to(self.distributed.device)
                 y = y.to(self.distributed.device)
 
-                # During DDP gradient accumulation, only the final
-                # micro-step needs gradient synchronization.
+                # During DDP gradient accumulation, only the final micro-step
+                # needs gradient synchronization.
                 if (
                     self.distributed.is_distributed
                     and micro_step
@@ -103,11 +98,9 @@ class Trainer:
                     context = torch.enable_grad()
 
                 with context:
-                    logits, loss = self.model(
-                        x,
-                        targets=y,
-                    )
+                    logits, loss = self.model(x, targets=y)
 
+                    # Scale loss so accumulated gradients match a full batch.
                     loss = (
                         loss
                         / self.config.train.grad_accumulation_steps
@@ -117,25 +110,15 @@ class Trainer:
 
                     loss.backward()
 
-            # ------------------------------------------------------
-            # Gradient clipping
-            # ------------------------------------------------------
-
+            # Clip gradients to avoid occasional spikes.
             norm = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(),
                 self.config.train.grad_clip,
             )
 
-            # ------------------------------------------------------
-            # Optimizer step
-            # ------------------------------------------------------
-
             self.optimizer.step()
 
-            # ------------------------------------------------------
-            # Reduce loss across GPUs
-            # ------------------------------------------------------
-
+            # Average the loss across all ranks for consistent logging.
             if self.distributed.is_distributed:
                 torch.distributed.all_reduce(
                     loss_accum,
@@ -144,10 +127,6 @@ class Trainer:
 
             loss_value = loss_accum.item()
 
-            # ------------------------------------------------------
-            # Update metrics
-            # ------------------------------------------------------
-
             self.metrics.end_step(
                 language=language,
                 loss=loss_value,
@@ -155,40 +134,35 @@ class Trainer:
                 grad_norm=norm.item(),
             )
 
-            # ------------------------------------------------------
-            # Logging
-            # ------------------------------------------------------
-
             if (
                 self.distributed.master_process
                 and step % self.config.train.log_interval == 0
             ):
                 self.metrics.report_step()
-                
+
             if (step + 1) % self.config.train.eval_interval == 0:
-                # put in eval mode
+                # Evaluation and sample generation — only on master.
                 self.model.eval()
-                
+
                 with torch.inference_mode():
                     results = self.evaluator.evaluate()
 
                 if self.distributed.master_process:
                     eval_metrics.results = results
-                    eval_metrics.report(
-                        step=step + 1,
-                    )
+                    eval_metrics.report(step=step + 1)
                     self.generate_samples(step=step + 1)
-                        
-                # Wait for master to finish generation before
-                # any rank starts the next training step.
+
+                # Wait for master to finish generation before any rank
+                # starts the next training step.
                 if self.distributed.is_distributed:
                     torch.distributed.barrier()
-                    
-                # back to train mode        
+
                 self.model.train()
-            
-            # Checkpoint
-            if (step + 1) % self.config.train.checkpoint_interval == 0 and self.distributed.master_process:
+
+            if (
+                (step + 1) % self.config.train.checkpoint_interval == 0
+                and self.distributed.master_process
+            ):
                 self.checkpoint_manager.save(
                     step=step + 1,
                     model=self.model,
@@ -198,16 +172,12 @@ class Trainer:
                     train_loader=self.train_loader,
                     metrics=self.metrics,
                 )
-                
-                # Make sure every rank waits until the checkpoint
-                # has been completely written.
-                if self.distributed.is_distributed:
-                    torch.distributed.barrier()
-                    
-        # ==========================================================
-        # TRAINING FINISHED
-        # ==========================================================
 
+            # Make sure every rank waits until the checkpoint is written.
+            if self.distributed.is_distributed:
+                torch.distributed.barrier()
+
+        # Training finished — save the final model for inference.
         if self.distributed.master_process:
             path = self.checkpoint_manager.save_final_model(
                 model=self.model,
@@ -216,11 +186,10 @@ class Trainer:
 
             print(f"Final model saved to: {path}")
 
-        # Make sure all ranks wait for final model to finish saving
+        # Make sure all ranks wait for the final save to complete.
         if self.distributed.is_distributed:
             torch.distributed.barrier()
-            
-           
+
     def generate_samples(self, step):
         urdu_prompt = "ایک زمانے کی بات ہے"
         hindi_prompt = "एक ज़माने की बात है۔"
@@ -264,8 +233,7 @@ class Trainer:
             top_k=top_k,
             max_new_tokens=max_new_tokens,
         )
-    
-     
+
     def save_generations(
         self,
         *,

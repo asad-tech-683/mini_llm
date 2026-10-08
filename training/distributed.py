@@ -27,7 +27,8 @@ class DistributedContext:
         torch.cuda.set_device(self.device)
 
         dist.init_process_group(
-            backend="nccl"
+            backend="nccl",
+            device_id=self.device,
         )
 
     def _setup_single_gpu(self):

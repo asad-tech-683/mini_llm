@@ -4,7 +4,7 @@ import torch.nn as nn
 from .block import Block
 
 
-class GPT(nn.Module):
+class Model(nn.Module):
     def __init__(self, config):
         super().__init__()
 
@@ -91,3 +91,43 @@ class GPT(nn.Module):
             )
 
         return logits, loss
+    
+    
+    def load_checkpoint(self, path, device="cpu"):
+        state_dict = torch.load(
+            path,
+            map_location=device,
+        )
+
+        # Remove DDP prefix if checkpoint was saved from DistributedDataParallel.
+        state_dict = {
+            key.removeprefix("module."): value
+            for key, value in state_dict.items()
+        }
+
+        # lm_head.weight is tied to transformer.wte.weight,
+        # so it does not need to be loaded separately.
+        state_dict.pop("lm_head.weight", None)
+
+        missing, unexpected = self.load_state_dict(
+            state_dict,
+            strict=False,
+        )
+
+        if unexpected:
+            raise RuntimeError(
+                f"Unexpected keys in checkpoint: {unexpected}"
+            )
+
+        # lm_head.weight is intentionally missing because it is tied
+        # to transformer.wte.weight.
+        allowed_missing = {"lm_head.weight"}
+
+        unexpected_missing = set(missing) - allowed_missing
+
+        if unexpected_missing:
+            raise RuntimeError(
+                f"Missing keys in checkpoint: {unexpected_missing}"
+            )
+
+        return self

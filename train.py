@@ -1,7 +1,7 @@
 import torch
 
 from config import Config
-from model.gpt import GPT
+from model.model import Model
 
 from data.dataloader import DataLoaderLite
 
@@ -14,11 +14,9 @@ from evaluation.evaluator import Evaluator
 from checkpoints.manager import CheckpointManager
 from inspect_model import ModelVisualizer
 
-def main():
-    # --------------------------------------------------------------
-    # Setup
-    # --------------------------------------------------------------
 
+def main():
+    # Set up distributed training context and load experiment config.
     distributed = DistributedContext()
     config = Config()
 
@@ -26,38 +24,32 @@ def main():
     print(f"Distributed: {distributed.is_distributed}")
     print(f"World size: {distributed.world_size}")
 
-    # --------------------------------------------------------------
-    # Model
-    # --------------------------------------------------------------
-
-
-    model = GPT(config)
+    # Build the model and move it to the right device. If we're running
+    # distributed, wrap it in DDP and keep a handle to the raw model.
+    model = Model(config)
     model.to(distributed.device)
-    
+
     model = distributed.wrap_model(model)
     raw_model = distributed.unwrap_model(model)
-    
+
+    # Uncomment to print a model summary and exit.
     # model_visualizer = ModelVisualizer(model=raw_model)
     # model_visualizer.summary()
     # import sys; sys.exit(0)
-    # --------------------------------------------------------------
-    # Data
-    # --------------------------------------------------------------
 
+    # Streaming dataloader that alternates between languages during training.
     train_loader = DataLoaderLite(
         B=config.train.batch_size,
         T=config.sequence_length,
         process_rank=distributed.rank,
         num_processes=distributed.world_size,
         split="train",
-        data_dir=config.tokenizer.data_path
+        data_dir=config.tokenizer.data_path,
     )
 
     print("DataLoader created successfully.")
 
-    # --------------------------------------------------------------
-    # Metrics
-    # --------------------------------------------------------------
+    # Metrics tracker for loss, LR, grad norm, and tokens seen per language.
     metrics = TrainingMetrics(
         total_tokens_by_language=train_loader.num_tokens,
         batch_size=config.train.batch_size,
@@ -69,10 +61,8 @@ def main():
 
     if distributed.master_process:
         metrics.summary()
-    # --------------------------------------------------------------
-    # Optimizer
-    # --------------------------------------------------------------
 
+    # AdamW with weight decay applied only to the right parameter groups.
     optimizer = configure_optimizer(
         model=model,
         weight_decay=config.train.weight_decay,
@@ -82,10 +72,7 @@ def main():
 
     print("Optimizer created successfully.")
 
-    # --------------------------------------------------------------
-    # Scheduler
-    # --------------------------------------------------------------
-
+    # Cosine schedule with linear warmup.
     scheduler = CosineScheduler(
         max_lr=config.train.max_lr,
         min_lr=config.train.min_lr,
@@ -95,9 +82,7 @@ def main():
 
     print("Scheduler created successfully.")
 
-    # --------------------------------------------------------------
-    # Evaluator
-    # --------------------------------------------------------------
+    # Evaluator runs on a fixed number of batches per language.
     evaluator = Evaluator(
         model=model,
         batch_size=config.train.batch_size,
@@ -105,19 +90,15 @@ def main():
         distributed=distributed,
         languages=("hindi", "urdu"),
         max_batches=20,
-        data_dir=config.tokenizer.data_path
+        data_dir=config.tokenizer.data_path,
     )
-    
-    # checkpoint manager
+
     checkpoint_manager = CheckpointManager()
-    
-    # # ----------------------------------------------------------
-    # # Resume
-    # # ----------------------------------------------------------
 
-    # start_step = 0
-
-    # checkpoint_path = "checkpoints/checkpoint_step_004000.pt"
+    # Resume from a checkpoint if one is provided. This restores model
+    # weights, optimizer state, scheduler state, and dataloader position.
+    start_step = 0
+    # checkpoint_path = "D:\\AI-ML\\multi_lang_variants\\32m\\2.0\\checkpoint_step_009000.pt"
 
     # if checkpoint_path:
     #     checkpoint = checkpoint_manager.load(
@@ -133,14 +114,10 @@ def main():
     #     start_step = checkpoint["step"]
 
     # if distributed.master_process:
-    #     print(
-    #         f"Resuming training from step {start_step}"
-    #     )
+    #     print(f"Resuming training from step {start_step}")
 
-    # --------------------------------------------------------------
-    # Trainer
-    # --------------------------------------------------------------
-
+    # The trainer handles the main loop, evaluation, generation, and
+    # periodic checkpointing.
     trainer = Trainer(
         model=model,
         train_loader=train_loader,
@@ -150,20 +127,13 @@ def main():
         distributed=distributed,
         config=config,
         evaluator=evaluator,
-        checkpoint_manager=checkpoint_manager
+        checkpoint_manager=checkpoint_manager,
     )
 
-    # --------------------------------------------------------------
-    # Training
-    # --------------------------------------------------------------
-
-    trainer.train()
-
-    # --------------------------------------------------------------
-    # Cleanup
-    # --------------------------------------------------------------
+    trainer.train(start_step=start_step)
 
     distributed.cleanup()
-    
+
+
 if __name__ == "__main__":
     main()

